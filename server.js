@@ -345,11 +345,13 @@ app.get('/plaid/sync', requireAuth, perUserLimiter(30), async (req, res) => {
       for (let i = 0; i < allTxns.length; i += 400) {
         batch = db.batch();
         allTxns.slice(i, i + 400).forEach(t => {
+          // Plaid convention: negative amount = income/credit, positive = expense/debit
           batch.set(userRef.collection('transactions').doc(t.transaction_id), {
             id:              t.transaction_id,
             account_id:      t.account_id,
             name:            t.name,
-            amount:          t.amount,
+            amount:          Math.abs(t.amount),
+            isCredit:        t.amount < 0,
             date:            t.date,
             category:        t.category         || [],
             pending:         t.pending,
@@ -552,8 +554,9 @@ app.delete('/user/account', requireAuth, async (req, res) => {
       await itemDoc.ref.delete();
     }
 
-    // 2. Delete all Firestore subcollections
-    for (const sub of ['accounts', 'transactions', 'goals', 'budgets', 'bills', 'plaid_items']) {
+    // 2. Delete all Firestore subcollections (CCPA: must erase everything)
+    for (const sub of ['accounts', 'transactions', 'goals', 'budgets', 'bills', 'plaid_items',
+                        'notifications', 'transaction_overrides', 'credit_history']) {
       let snap;
       do {
         snap = await userRef.collection(sub).limit(400).get();
@@ -1431,7 +1434,8 @@ async function _sendWeeklySummaryForUser(uid, userData) {
   const categories = {};
   txnSnap.docs.forEach(d => {
     const t = d.data();
-    if (t.amount > 0) { // Positive = expense in Plaid
+    // isCredit=false means expense. Amount is always stored positive (Math.abs) after the fix.
+    if (!t.isCredit) {
       totalSpent += t.amount;
       const cat = (t.category && t.category[0]) || 'Other';
       categories[cat] = (categories[cat] || 0) + t.amount;
@@ -1487,7 +1491,8 @@ if (cron) {
       let sent = 0;
       for (const userDoc of usersSnap.docs) {
         const data = userDoc.data();
-        if (!data.plaid_linked) continue; // Skip users with no bank linked
+        // Send reminders to all users who have notifications enabled —
+        // bills can exist without Plaid being linked (manually added bills)
         await _sendBillRemindersForUser(userDoc.id, data).catch(err =>
           console.error(`[cron/bills] uid:${userDoc.id}:`, err.message)
         );
@@ -1699,11 +1704,13 @@ async function _webhookSyncItem(itemId) {
     for (let i = 0; i < allTxns.length; i += 400) {
       batch = db.batch();
       allTxns.slice(i, i + 400).forEach(t => {
+        // Plaid convention: negative amount = income/credit, positive = expense/debit
         batch.set(userRef.collection('transactions').doc(t.transaction_id), {
           id:              t.transaction_id,
           account_id:      t.account_id,
           name:            t.name,
-          amount:          t.amount,
+          amount:          Math.abs(t.amount),
+          isCredit:        t.amount < 0,
           date:            t.date,
           category:        t.category         || [],
           pending:         t.pending,
