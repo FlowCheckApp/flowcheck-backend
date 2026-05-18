@@ -317,18 +317,15 @@ app.get('/plaid/sync', requireAuth, perUserLimiter(30), async (req, res) => {
 
     if (!itemSnaps.length) return res.status(404).json({ message: 'No linked account' });
 
-    const now   = new Date();
-    const start = new Date(+now - 90 * 864e5);
-    const fmt   = d => d.toISOString().slice(0, 10);
-    const TS    = admin.firestore.FieldValue.serverTimestamp;
-
-    let totalAccounts = 0, totalTxns = 0;
+    const TS = admin.firestore.FieldValue.serverTimestamp;
+    let totalAccounts = 0, totalAdded = 0, totalModified = 0, totalRemoved = 0;
 
     for (const itemDoc of itemSnaps) {
-      const { access_token } = itemDoc.data();
+      const itemData = itemDoc.data();
+      const { access_token } = itemData;
       if (!access_token) continue;
 
-      /* Accounts */
+      /* ── Accounts (always fresh — small write, critical for balance accuracy) ── */
       const { data: acctData } = await plaid.accountsGet({ access_token });
       const accounts = acctData.accounts.map(a => ({
         id:                a.account_id,
@@ -340,36 +337,41 @@ app.get('/plaid/sync', requireAuth, perUserLimiter(30), async (req, res) => {
         balance_available: a.balances.available ?? null,
         currency:          a.balances.iso_currency_code || 'USD',
         mask:              a.mask           || null,
-        item_id:           itemDoc.data().item_id || itemDoc.id,
+        item_id:           itemData.item_id || itemDoc.id,
       }));
 
-      /* Transactions — paginate through all results */
-      let allTxns = [], offset = 0, total = Infinity;
-      while (allTxns.length < total) {
-        const { data: txnData } = await plaid.transactionsGet({
-          access_token,
-          start_date: fmt(start),
-          end_date:   fmt(now),
-          options:    { count: 500, offset },
-        });
-        total = txnData.total_transactions;
-        allTxns = allTxns.concat(txnData.transactions);
-        offset += txnData.transactions.length;
-        if (!txnData.transactions.length) break;
-      }
-
-      /* Write accounts to Firestore */
       let batch = db.batch();
       accounts.forEach(a => {
         batch.set(userRef.collection('accounts').doc(a.id), { ...a, updated_at: TS() }, { merge: true });
       });
       await batch.commit();
 
-      /* Write transactions in batches of 400 */
-      for (let i = 0; i < allTxns.length; i += 400) {
+      /* ── Transactions — cursor-based (only writes the delta, not all history) ── */
+      // After first sync the cursor is stored, so subsequent syncs only write
+      // new/modified/removed transactions — dramatically fewer Firestore writes.
+      let cursor = itemData.plaid_cursor || undefined;
+      let added = [], modified = [], removed = [];
+      let hasMore = true;
+
+      while (hasMore) {
+        const reqBody = { access_token, count: 500 };
+        if (cursor) reqBody.cursor = cursor;
+        const { data } = await plaid.transactionsSync(reqBody);
+        added    = added.concat(data.added);
+        modified = modified.concat(data.modified);
+        removed  = removed.concat(data.removed);
+        hasMore  = data.has_more;
+        cursor   = data.next_cursor;
+      }
+
+      // Persist new cursor so next sync is a true delta
+      await itemDoc.ref.update({ plaid_cursor: cursor });
+
+      /* Write added + modified transactions */
+      const upserts = [...added, ...modified];
+      for (let i = 0; i < upserts.length; i += 400) {
         batch = db.batch();
-        allTxns.slice(i, i + 400).forEach(t => {
-          // Plaid convention: negative amount = income/credit, positive = expense/debit
+        upserts.slice(i, i + 400).forEach(t => {
           batch.set(userRef.collection('transactions').doc(t.transaction_id), {
             id:              t.transaction_id,
             account_id:      t.account_id,
@@ -377,7 +379,9 @@ app.get('/plaid/sync', requireAuth, perUserLimiter(30), async (req, res) => {
             amount:          Math.abs(t.amount),
             isCredit:        t.amount < 0,
             date:            t.date,
-            category:        t.category         || [],
+            category:        t.personal_finance_category?.primary
+                               ? [t.personal_finance_category.primary]
+                               : (t.category || []),
             pending:         t.pending,
             merchant_name:   t.merchant_name    || null,
             logo_url:        t.logo_url         || null,
@@ -388,13 +392,24 @@ app.get('/plaid/sync', requireAuth, perUserLimiter(30), async (req, res) => {
         await batch.commit();
       }
 
-      totalAccounts += accounts.length;
-      totalTxns     += allTxns.length;
-      console.log(`[sync] uid:${req.uid} item:${itemDoc.id} → ${accounts.length} accounts, ${allTxns.length} txns`);
+      /* Delete removed transactions */
+      for (let i = 0; i < removed.length; i += 400) {
+        batch = db.batch();
+        removed.slice(i, i + 400).forEach(r => {
+          batch.delete(userRef.collection('transactions').doc(r.transaction_id));
+        });
+        await batch.commit();
+      }
+
+      totalAccounts  += accounts.length;
+      totalAdded     += added.length;
+      totalModified  += modified.length;
+      totalRemoved   += removed.length;
+      console.log(`[sync] uid:${req.uid} item:${itemDoc.id} → ${accounts.length} accounts, +${added.length}~${modified.length}-${removed.length} txns`);
     }
 
     await userRef.update({ last_synced: TS() });
-    res.json({ accounts: totalAccounts, transactions: totalTxns });
+    res.json({ accounts: totalAccounts, added: totalAdded, modified: totalModified, removed: totalRemoved });
   } catch (err) {
     const msg = err.response?.data?.error_message || err.message;
     console.error('[sync]', msg);
@@ -1661,7 +1676,7 @@ async function _verifyPlaidJwt(token, rawBodyBuf) {
  * Finds the user who owns this item, then re-runs account + transaction sync.
  * Errors are logged but never surface to the caller (webhook must always 200).
  */
-async function _webhookSyncItem(itemId) {
+async function _webhookSyncItem(itemId, retryCount = 0) {
   try {
     // Find the user who owns this item_id
     const itemSnap = await db.collectionGroup('plaid_items')
@@ -1677,19 +1692,17 @@ async function _webhookSyncItem(itemId) {
     const itemDoc  = itemSnap.docs[0];
     const userRef  = itemDoc.ref.parent.parent; // users/{uid}
     const uid      = userRef.id;
-    const { access_token } = itemDoc.data();
+    const itemData = itemDoc.data();
+    const { access_token } = itemData;
 
     if (!access_token) {
       console.warn(`[webhook] item ${itemId} has no access_token`);
       return;
     }
 
-    const TS  = admin.firestore.FieldValue.serverTimestamp;
-    const now = new Date();
-    const start = new Date(+now - 90 * 864e5);
-    const fmt = d => d.toISOString().slice(0, 10);
+    const TS = admin.firestore.FieldValue.serverTimestamp;
 
-    // ── Accounts ──────────────────────────────────────────────────
+    // ── Accounts (always fresh — small write, critical for balance accuracy) ──
     const { data: acctData } = await plaid.accountsGet({ access_token });
     const accounts = acctData.accounts.map(a => ({
       id:                a.account_id,
@@ -1710,25 +1723,30 @@ async function _webhookSyncItem(itemId) {
     });
     await batch.commit();
 
-    // ── Transactions (paginated) ──────────────────────────────────
-    let allTxns = [], offset = 0, total = Infinity;
-    while (allTxns.length < total) {
-      const { data: txnData } = await plaid.transactionsGet({
-        access_token,
-        start_date: fmt(start),
-        end_date:   fmt(now),
-        options:    { count: 500, offset },
-      });
-      total = txnData.total_transactions;
-      allTxns = allTxns.concat(txnData.transactions);
-      offset += txnData.transactions.length;
-      if (!txnData.transactions.length) break;
+    // ── Transactions — cursor-based delta sync ──────────────────────
+    let cursor = itemData.plaid_cursor || undefined;
+    let added = [], modified = [], removed = [];
+    let hasMore = true;
+
+    while (hasMore) {
+      const reqBody = { access_token, count: 500 };
+      if (cursor) reqBody.cursor = cursor;
+      const { data } = await plaid.transactionsSync(reqBody);
+      added    = added.concat(data.added);
+      modified = modified.concat(data.modified);
+      removed  = removed.concat(data.removed);
+      hasMore  = data.has_more;
+      cursor   = data.next_cursor;
     }
 
-    for (let i = 0; i < allTxns.length; i += 400) {
+    // Persist new cursor
+    await itemDoc.ref.update({ plaid_cursor: cursor });
+
+    /* Write added + modified */
+    const upserts = [...added, ...modified];
+    for (let i = 0; i < upserts.length; i += 400) {
       batch = db.batch();
-      allTxns.slice(i, i + 400).forEach(t => {
-        // Plaid convention: negative amount = income/credit, positive = expense/debit
+      upserts.slice(i, i + 400).forEach(t => {
         batch.set(userRef.collection('transactions').doc(t.transaction_id), {
           id:              t.transaction_id,
           account_id:      t.account_id,
@@ -1736,7 +1754,9 @@ async function _webhookSyncItem(itemId) {
           amount:          Math.abs(t.amount),
           isCredit:        t.amount < 0,
           date:            t.date,
-          category:        t.category         || [],
+          category:        t.personal_finance_category?.primary
+                             ? [t.personal_finance_category.primary]
+                             : (t.category || []),
           pending:         t.pending,
           merchant_name:   t.merchant_name    || null,
           logo_url:        t.logo_url         || null,
@@ -1747,9 +1767,25 @@ async function _webhookSyncItem(itemId) {
       await batch.commit();
     }
 
+    /* Delete removed */
+    for (let i = 0; i < removed.length; i += 400) {
+      batch = db.batch();
+      removed.slice(i, i + 400).forEach(r => {
+        batch.delete(userRef.collection('transactions').doc(r.transaction_id));
+      });
+      await batch.commit();
+    }
+
     await userRef.update({ last_synced: TS() });
-    console.log(`[webhook] Synced uid:${uid} item:${itemId} → ${accounts.length} accounts, ${allTxns.length} txns`);
+    console.log(`[webhook] Synced uid:${uid} item:${itemId} → ${accounts.length} accounts, +${added.length}~${modified.length}-${removed.length} txns`);
   } catch (err) {
+    // FAILED_PRECONDITION on a brand-new item means Plaid isn't ready yet — retry once
+    if (err.code === 9 && retryCount < 2) {
+      const delay = (retryCount + 1) * 30_000; // 30s, 60s
+      console.warn(`[webhook] FAILED_PRECONDITION for item ${itemId} — retrying in ${delay / 1000}s`);
+      setTimeout(() => _webhookSyncItem(itemId, retryCount + 1), delay);
+      return;
+    }
     console.error(`[webhook] Sync failed for item ${itemId}:`, err.message);
   }
 }
